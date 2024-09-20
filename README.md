@@ -1,5 +1,7 @@
 The R markdown file is the script for the analysis of tissue infiltrating immune cells in 17,265 breast tumours from 22 studies participating in the B-CAST project.
 
+The data are available on the European genome Phenome Archive at https://ega
+
 There are two linked data sets
 
 **case_data.csv** is the clinical data set for 17,265 cases with a single row per case
