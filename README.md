@@ -9,27 +9,27 @@ There are two linked data sets
 study -        study acromym     
 bcac_id	-		   unique identifier in BCAC database.    
 site -         variable use to adjust by study pooling studies with few events    
-yod -          year of diagnosis
-morphology -   tumour morhology
-age_diag -     age at diagnosis
-status -       vital status at last follow up
-years_status - years to last follow up
-enter -        time (years) between diagnsosis and recruitment
-grade -        tumour grade
-size -         tumour size
-nodes -        number positive lymph nodes
-er -           estrogen receptor status
-pr -           progesterone receptor status
-her2 -         HER2 status
-br_death -     death from breast cancer
-er_ast -       automated score for estrogen receptor using astrogrid (a)
-er_ari -       automated score for estrogen receptor using Ariol (b)
-fu_15 -        follow-up time censored at 15 years
-br_15 -        breast cancer specific death at 15 years with unknown coded as breast cancer death
-bcss_15 -      breast cancer specific death at 15 years with unknown censored
-horm -         indicator variable for adjuvant hormone therapy
-tras -         indicator variable for adjuvant trastuzumab
-radio -        type of radiotherapy
+yod -          year of diagnosis.    
+morphology -   tumour morhology     
+age_diag -     age at diagnosis     
+status -       vital status at last follow up     
+years_status - years to last follow up     
+enter -        time (years) between diagnsosis and recruitment     
+grade -        tumour grade     
+size -         tumour size                
+nodes -        number positive lymph nodes     
+er -           estrogen receptor status     
+pr -           progesterone receptor status     
+her2 -         HER2 status     
+br_death -     death from breast cancer     
+er_ast -       automated score for estrogen receptor using astrogrid (a)     
+er_ari -       automated score for estrogen receptor using Ariol (b)     
+fu_15 -        follow-up time censored at 15 years     
+br_15 -        breast cancer specific death at 15 years with unknown coded as breast cancer death     
+bcss_15 -      breast cancer specific death at 15 years with unknown censored.    
+horm -         indicator variable for adjuvant hormone therapy     
+tras -         indicator variable for adjuvant trastuzumab     
+radio -        type of radiotherapy     
 chemo -        indicator variable for adjuvant chemotherapy
 
 (a)	see description of how these derived in  Ali HR, et al   Astronomical algorithms for automated analysis of tissue protein expression in breast cancer.  Br. J. Cancer  108, 602-12, 2013.  PMID 23329232        
