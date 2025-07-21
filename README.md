@@ -8,7 +8,7 @@ There are two linked data sets
 
 study -        study acromym     
 bcac_id	-		   unique identifier in BCAC database.    
-site -         variable use to adjust by study pooling studies with few events    
+site -         variable use to adjust by study where studies with few events are pooled    
 yod -          year of diagnosis.    
 morphology -   tumour morhology     
 age_diag -     age at diagnosis     
@@ -57,37 +57,34 @@ The third data set is derived from the two primary data sets
 Each data set at each threshold comprises one row per case with TIIC scores based on the mean value for multiple cores.
 Thus the total number of rows is 81810  - 12,285 cases x 11 imputed data sets x 6 thresholds.
 
-.imp	-    	       imputation number (0 is non-imputed data)        
-.id			-	         patient identifier        
-site    
-age_diag	-		     age at diagnosis        
-enter		-		       time from diagnosis to study entry        
-fu_15		-		       follow-up in years censored at 15         
-br_15		-		        breast cancer death censored at 15 years        
-grade		-		        tumour grade        
-size	-			        tumour size (mm)        
-nodes		-		        number positive regional nodes        
-er		-		          estrogen receptor status        
-her2	-			        her2 status        
-age1	derived  -     variable: age at diagnosis as fractional polynomial function (see b)        
-age2	derived  -     variable: age at diagnosis as fractional polynomial function (see b)        
-cores_CD163		-      number cores for patient with CD163 scores               
-std_all_CD8		-	    (see c)        
-std_tumour_CD8	-	  (c)        
-std_all_CD20		-    (c)        
-std_stroma_CD20	-  (c)        
-std_tumour_CD20		-  (c)        
-std_all_CD163		-    (c)        
-std_stroma_CD163	-	(c)        
-std_tumour_CD163	-	(c)        
-std_all_FOXP3		-    (c)        
-std_stroma_FOXP3	-	(c)        
-std_tumour_FOXP3	-	(c)        
-threshold		-	      minimum area (mm2) threshold for inclusion or core data
-
-(a) 	see description of how these derived in  Ali HR, et al   Astronomical algorithms for automated analysis of tissue protein expression in breast cancer.  Br. J. Cancer  108, 602-12, 2013.  PMID 23329232        
-Howat WJ et al.  Performance of automated scoring of ER, PR, HER2, CK5/6 and EGFR in breast cancer tissue microarrays in the Breast Cancer Association Consortium.  J Pathol Clin Res  1, 18-32, 2015.  PMID 27499890
+.imp	-    	    imputation number (0 is non-imputed data)        
+.id	-	          patient identifier  
+threshold	-	    minimum area (mm2) threshold for inclusion or core data
+site -          variable use to adjust by study where studies with few events are pooled    
+enter -		      time from diagnosis to study entry        
+fu_15	-		      follow-up in years censored at 15         
+br_15	-		      breast cancer death censored at 15 years       
+age1	derived - variable: age at diagnosis as fractional polynomial function (see a)        
+age2	derived - variable: age at diagnosis as fractional polynomial function (see a)    
+grade	-		      tumour grade        
+size -			    tumour size (mm)        
+nodes	 -		    number positive regional nodes        
+er -		        estrogen receptor status        
+pr -            progesterone receptor status     
+her2	-			    her2 status                    
+all_CD8		-	    (see b)        
+stroma_CD8      (b)
+tumour_CD8 -	  (b)        
+all_CD20 -      (b)        
+stroma_CD20	-   (b)        
+tumour_CD20	-   (b)        
+all_CD163	-     (b)        
+stroma_CD163 -	(b)        
+tumour_CD163 -	(b)        
+all_FOXP3		-   (b)        
+stroma_FOXP3 -	(b)        
+tumour_FOXP3 -	(b)        
 
 (b) 	calculated as described in manuscript methods
 
-(c) 	mean standardised log percentage area TIIC all/stroma/tumour and CD163, CD20, CD8, FOXP3
+(b) 	mean standardised log percentage area TIIC all/stroma/tumour and CD163, CD20, CD8, FOXP3
