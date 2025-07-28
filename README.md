@@ -1,4 +1,4 @@
-The R markdown file is the script for the analysis of tissue infiltrating immune cells in 12,285 breast tumours from 22 studies participating in the B-CAST project.
+The R markdown file is the script for the analysis of tissue infiltrating immune cells in 12,285 breast tumours from 20 studies participating in the B-CAST project.
 
 There are two linked data sets
 
