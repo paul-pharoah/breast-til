@@ -24,10 +24,11 @@ er_ast -       automated score for estrogen receptor using astrogrid (a)
 er_ari -       automated score for estrogen receptor using Ariol (b)     
 fu_15 -        follow-up time censored at 15 years     
 br_15 -        breast cancer specific death at 15 years with unknown coded as breast cancer death     
-bcss_15 -      breast cancer specific death at 15 years with unknown censored.    
+bcss_15 -      breast cancer specific death at 15 years with unknown censored
+core_size -    size of tissue cores in tissue micro-arrays
 horm -         indicator variable for adjuvant hormone therapy     
 tras -         indicator variable for adjuvant trastuzumab     
-radio -        type of radiotherapy     
+radio -        indicator variable for radiotherapy     
 chemo -        indicator variable for adjuvant chemotherapy
 
 (a)	see description of how these derived in  Ali HR, et al   Astronomical algorithms for automated analysis of tissue protein expression in breast cancer.  Br. J. Cancer  108, 602-12, 2013.  PMID 23329232        
@@ -48,41 +49,3 @@ area_artefact_mn	-	    area of artefact from mininet algorithm
 area_all_til_halo	-     percentage of all tissue occupied by TIICs from halo algorithm        
 area_stroma_til_halo -	percentage of stroma occupied by TIICs from halo algorithm        
 area_tumour_til_halo	- percentage of tumour occupied by TIICs from halo algorithm
-
-The third data set is derived from the two primary data sets
-
-**imputed_data.csv** includes the merged non-imputed data and ten imputed data sets at each of six minimum area (mm2) thresholds for exclusion of core level data. 
-Each data set at each threshold comprises one row per case with TIIC scores based on the mean value for multiple cores.
-Thus the total number of rows is 81810  - 12,285 cases x 11 imputed data sets x 6 thresholds.
-
-.imp	-    	    imputation number (0 is non-imputed data)        
-.id	-	          patient identifier  
-threshold	-	    minimum area (mm2) threshold for inclusion or core data
-site -          variable use to adjust by study where studies with few events are pooled    
-enter -		      time from diagnosis to study entry        
-fu_15	-		      follow-up in years censored at 15         
-br_15	-		      breast cancer death censored at 15 years       
-age1	derived - variable: age at diagnosis as fractional polynomial function (see a)        
-age2	derived - variable: age at diagnosis as fractional polynomial function (see a)    
-grade	-		      tumour grade        
-size -			    tumour size (mm)        
-nodes	 -		    number positive regional nodes        
-er -		        estrogen receptor status        
-pr -            progesterone receptor status     
-her2	-			    her2 status                    
-all_CD8		-	    (see b)        
-stroma_CD8      (b)
-tumour_CD8 -	  (b)        
-all_CD20 -      (b)        
-stroma_CD20	-   (b)        
-tumour_CD20	-   (b)        
-all_CD163	-     (b)        
-stroma_CD163 -	(b)        
-tumour_CD163 -	(b)        
-all_FOXP3		-   (b)        
-stroma_FOXP3 -	(b)        
-tumour_FOXP3 -	(b)        
-
-(b) 	calculated as described in manuscript methods
-
-(b) 	mean standardised log percentage area TIIC all/stroma/tumour and CD163, CD20, CD8, FOXP3
