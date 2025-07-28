@@ -1,0 +1,1153 @@
+---
+title: "tiic_analysis"
+output: html_document
+date: "2024-07-10"
+---
+
+```{r setup, include=FALSE, warnings=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warnings=FALSE)
+library(tidyverse)
+library(survival)
+library(broom)
+library(janitor)
+library(meta)
+library(mice)
+library(lemon)
+library(patchwork)
+library(tableone)
+library(scales)
+```
+
+## Read in case data and TIIC automated scores 
+
+```{r data}
+# Phenotype data
+pheno <- read_csv("./Data/case_data.csv")
+# TIIC score data by core
+halo <- read_csv("./Data/tiic_scores.csv") 
+
+# Supplementary table 3
+cores_case <- halo |> select(study, marker, bcac_id) |> 
+  group_by(marker, bcac_id) |> summarise(count = n()) |> ungroup() |> 
+  count(marker, count) |>   pivot_wider(names_from = 'marker', values_from='n')
+
+write_csv(cores_case, "./Outputs/table_s3.csv")
+
+# Supplementary table 4
+cores_study <- halo |> select(study, marker, bcac_id) |> 
+  group_by(marker, study) |> summarise(count = n()) |> ungroup() |> 
+  pivot_wider(names_from = 'marker', values_from='count')
+write_csv(cores_study, "./Outputs/table_s4.csv")
+
+# Supplementary table 8
+mortality <- pheno |> filter(yod>=2000) |> select(status, fu_15, br_15, bcss_15) |>
+  mutate(fu_gp = cut(fu_15, breaks=c(0, 5, 10, 15), right=FALSE))
+
+bcss <- count(filter(mortality, bcss_15==1), fu_gp, bcss_15) |> select(1, 3) |> rename(bcss = n)
+br <- count(filter(mortality, br_15==1), fu_gp, br_15) |> select(1, 3) |> rename(br = n)
+all <- count(filter(mortality, status==1), fu_gp, status) |> select(1, 3) |> rename(all = n) |>
+  left_join(bcss) |> left_join(br) |>
+  mutate(other = all - br,
+         known = bcss + all - br,
+         unknown = br - bcss) |>
+  filter(!is.na(fu_gp)) |> select(fu_gp, bcss, other, known, unknown)
+write_csv(all, "./Outputs/table_s8.csv")
+rm(cores_case, cores_study, mortality, bcss, br, all)
+
+```
+
+## Functions for data wrangling and modelling
+
+data_fun generates patient level scores from the automated core level scores as a function of the threshold for excluding cores based on minimum tissue area.  The scores are then merged with the clinical data and the derived age variables created.
+
+```{r functions}
+# Function to generate patient level data for different thresholds of viable core area
+data_fun <- function(x) {
+  data <- halo |>
+    filter(area_all_mn>x) |>
+    #Generate patient level scores
+    group_by(marker, bcac_id) |> 
+    summarise(cores=n(),
+              area_all = mean(area_all_mn, na.rm=TRUE),
+              area_stroma = mean(area_stroma_mn, na.rm=TRUE),
+              area_tumour = mean(area_tumour_mn, na.rm=TRUE),
+              area_artefact = mean(area_artefact_mn, na.rm=TRUE),
+              area_til_all = mean(area_all_til_halo, na.rm=TRUE),
+              area_til_stroma = mean(area_stroma_til_halo, na.rm=TRUE),
+              area_til_tumour = mean(area_tumour_til_halo, na.rm=TRUE)) |>
+    # Generate patient level percent area scores
+    mutate(pct_til_all = area_til_all/(10^4*area_all),
+           pct_til_stroma = ifelse(area_stroma==0, NA, area_til_stroma/(area_stroma*10^4)),
+           pct_til_tumour = ifelse(area_tumour==0, NA, area_til_tumour/(area_tumour*10^4)),
+           pct_artefact = area_artefact/(area_artefact + area_all),
+           log_pct_til_all = log(pct_til_all + 0.01),
+           log_pct_til_stroma = log(pct_til_stroma + 0.01), 
+           log_pct_til_tumour = log(pct_til_tumour + 0.01), 
+           std_all = scale(log(pct_til_all + 0.1), center=TRUE, scale=TRUE)[,1],
+           std_stroma = scale(log(pct_til_stroma + 0.1), center=TRUE, scale=TRUE)[,1],
+           std_tumour = scale(log(pct_til_tumour + 0.1), center=TRUE, scale=TRUE)[,1]) |>
+    select(bcac_id, marker, cores, 11:13, 18:20) |>
+    pivot_wider(id_cols = bcac_id,
+                names_from=marker,
+                values_from = c(cores, pct_til_all, pct_til_stroma, pct_til_tumour,
+                                std_all, std_stroma, std_tumour)) |>
+    right_join(filter(pheno, !is.na(er), !is.na(br_15))) |>
+    mutate(threshold=x,
+           # Generate PREDICT age variables
+           age1 = ifelse(er==1, (age_diag/10)^-2, age_diag),
+           age2 = ifelse(er==1, (age_diag/10)^-2*log(age_diag/10), 0)) |>
+    select(-er_ast, -er_ari)
+  return(data)
+}
+
+models_fun <- function(models) {
+  summaries <- lapply(models, summary)
+  term <- names(df[,6:29])
+  estimate <- as.numeric(unlist(lapply(summaries, function(x) x$coefficients[1,1])))
+  std.error <- as.numeric(unlist(lapply(summaries, function(x) x$coefficients[1,3])))
+  p.value <- as.numeric(unlist(lapply(summaries, function(x) x$coefficients[1,5])))
+  n <- as.numeric(unlist(lapply(summaries, function(x) x$n)))
+  nevents <- as.numeric(unlist(lapply(summaries, function(x) x$nevent)))
+  uv <- tibble(term, estimate, std.error, p.value, n, nevents) |>
+    mutate(imputation = "Not applicable",
+           variable = "Single marker",
+           area = threshold,
+           subtype = ifelse(er_status==1, "ER positive", "ER negative"),
+           analysis = "Complete case analysis")
+  return(uv)
+}
+```
+
+## Single marker complete case analysis to compare percent area with log percent and to compare different area exclusion thresholds
+
+```{r cca}
+# Vector of thresholds for exluding cores based on minimum tissue area
+t_values <- c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
+
+data <- map_df(t_values, data_fun) |>
+  select(yod, threshold, er, site, enter, fu_15, br_15, 
+         age1, age2, size, nodes, grade, pct_til_all_CD163:std_tumour_FOXP3) |> 
+  pivot_longer(cols=13:36, names_to='tiic', values_to='score')
+
+# Set up empty tibble for storing results
+uni_marker <- tibble()
+
+df <- data |> group_by(threshold, er, tiic) |> nest()
+
+partial <- df |> 
+  mutate(model = map(data, ~coxph(Surv(enter, fu_15, br_15) ~ site + age1 + age2 + score, data=.x))) |>
+  mutate(tidy.model = map(model, broom::tidy),
+         number = map_dbl(model, ~(.x$n)),
+         events = map_dbl(model, ~(.x$nevent))) |>
+  ungroup() |>
+  select(threshold, er, tiic, number, events, tidy.model) |>
+  unnest(cols=c(tidy.model)) |>
+  filter(term == "score") |>
+  mutate(adjust="Partial")
+
+uni_marker <- df |> 
+  mutate(model = map(data, ~coxph(Surv(enter, fu_15, br_15) ~ site + age1 + age2 + 
+                                    size + nodes + grade + tt(grade) + score, 
+                                  tt = function(x, t, ...) { x * log(t)}, data=.x))) |>
+  mutate(tidy.model = map(model, broom::tidy),
+         number = map_dbl(model, ~(.x$n)),
+         events = map_dbl(model, ~(.x$nevent))) |>
+  ungroup() |>
+  select(threshold, er, tiic, number, events, tidy.model) |>
+  unnest(cols=c(tidy.model)) |>
+  filter(term == "score") |>
+  mutate(adjust="Full") |>
+  bind_rows(partial) |>
+  mutate(score = ifelse(str_detect(tiic, "pct"), "Pct", "Std"),
+         marker = case_when(str_detect(tiic, "CD8") ~ "CD8",
+                           str_detect(tiic, "CD20") ~ "CD20",
+                           str_detect(tiic, "CD163") ~ "CD163",
+                           str_detect(tiic, "FOXP3") ~ "FOXP3"),
+         compartment = case_when(str_detect(tiic, "all") ~ "All",
+                                 str_detect(tiic, "stroma") ~ "Stroma",
+                                 str_detect(tiic, "tumour") ~ "Tumour"),
+         hr = exp(estimate),
+         lcl = exp(estimate - qnorm(.975)*std.error),
+         ucl = exp(estimate + qnorm(.975)*std.error),
+         signif = p.value<0.001,
+         variable="Single marker",
+         analysis="Complete case analysis",
+         subtype = ifelse(er==0, "ER negative", "ER positive")) |>
+  rename(area = threshold) |> select(variable, analysis, area, subtype, marker, compartment, adjust, score, 
+         estimate, std.error, hr, lcl, ucl, p.value, signif, number, events) |>
+  arrange(variable, analysis, area, subtype, marker, compartment, adjust, score)
+
+write_csv(uni_marker, "./Outputs/unimarker_results.csv")
+rm(partial, df, data)
+```
+
+## Choosing best threshold for year of diagnosis, tumour area threshold and TIIC score transformation
+
+```{r}
+# Count which score (percent area of log percent) is best for each model
+uni_marker |> group_by(area, subtype, marker, compartment, adjust) |>
+  slice(which.min(p.value)) |> ungroup() |> count(score)
+
+# Count which area threshold is best for each model
+uni_marker |> group_by(subtype, marker, compartment, adjust, score) |>
+  slice(which.min(p.value)) |> ungroup() |> count(area)
+```
+
+Area threshold of greater than 0.05 mm2 is the most often the most significant association for any given analysis, and the standardised log percentage is most often the most significant association for any given analysis
+
+# Imputation of missing data  ----
+
+Missingness of TIIC scores depends on threshold used for excluding cores with limited tissue area.  Thus data needs to be imputed for each threshold for data exclusion.
+
+```{r impute}
+# Number of imputed data sets
+iterations <- 10
+df <- tibble()
+
+for (threshold in t_values) { 
+  mv <- halo |>
+    mutate(area_all_mn = ifelse(area_all_mn<threshold, NA, area_all_mn),
+           area_stroma_mn = ifelse(area_all_mn<threshold, NA, area_stroma_mn),
+           area_tumour_mn = ifelse(area_all_mn<threshold, NA, area_tumour_mn),
+           area_all_til_halo = ifelse(area_all_mn<threshold, NA, area_all_til_halo),
+           area_stroma_til_halo = ifelse(area_all_mn<threshold, NA, area_stroma_til_halo),
+           area_tumour_til_halo = ifelse(area_all_mn<threshold, NA, area_tumour_til_halo)) |>
+    #Generate patient level scores
+    group_by(marker, bcac_id) |>
+    summarise(cores=n(),
+              area_all = mean(area_all_mn, na.rm=TRUE),
+              area_stroma = mean(area_stroma_mn, na.rm=TRUE),
+              area_tumour = mean(area_tumour_mn, na.rm=TRUE),
+              area_artefact = mean(area_artefact_mn, na.rm=TRUE),
+              area_til_all = mean(area_all_til_halo, na.rm=TRUE),
+              area_til_stroma = mean(area_stroma_til_halo, na.rm=TRUE),
+              area_til_tumour = mean(area_tumour_til_halo, na.rm=TRUE)) |>
+    mutate(pct_til_all = area_til_all/(10^4*area_all),
+           pct_til_stroma = ifelse(area_stroma==0, NA, area_til_stroma/(area_stroma*10^4)),
+           pct_til_tumour = ifelse(area_tumour==0, NA, area_til_tumour/(area_tumour*10^4)),
+           pct_artefact = area_artefact/(area_artefact + area_all),
+           log_pct_til_all = log(pct_til_all + 0.1),
+           log_pct_til_stroma = log(pct_til_stroma + 0.1),
+           log_pct_til_tumour = log(pct_til_tumour + 0.1)) |>
+    select(bcac_id, marker, cores, 15:17 ) |>
+    pivot_wider(id_cols = bcac_id,
+                names_from=marker,
+                values_from = c(cores, log_pct_til_all, log_pct_til_stroma, log_pct_til_tumour)) |>
+    right_join(pheno) |> 
+    # exclude variables not used for imputation
+    select(-site, -bcss_15) |> 
+    mutate(nodes = log(nodes+0.1),
+           size = log(size),
+           grade= as.factor(grade),
+           er = as.factor(er),
+           pr = as.factor(pr),
+           her2 = as.factor(her2),
+           horm = as.factor(horm),
+           tras=as.factor(tras),
+           radio=as.factor(radio),
+           chemo=as.factor(chemo))
+  
+  set.seed <- 290962
+  imp <- mice(mv, m=iterations, defaultMethod = c("norm", "logreg", "polyreg", "polr"))
+  imp.long <- mice::complete(imp,"long",include = T)  |>
+    mutate(grade = as.numeric(grade),
+           size = exp(size),
+           nodes = case_when(exp(nodes)-0.1 < 1e-05 ~ 0,
+                             exp(nodes)-0.1 > 50 ~ 50,
+                             TRUE ~ exp(nodes)-0.1),
+           age1 = ifelse(er==1, (age_diag/10)^-2, age_diag),
+           age2 = ifelse(er==1, (age_diag/10)^-2*log(age_diag/10), 0),
+           threshold = threshold) |>
+    group_by(.imp) |>
+    mutate(  all_CD8 = scale(log_pct_til_all_CD8, center=TRUE, scale=TRUE)[,1],
+             stroma_CD8 = scale(log_pct_til_stroma_CD8, center=TRUE, scale=TRUE)[,1],
+             tumour_CD8 = scale(log_pct_til_tumour_CD8, center=TRUE, scale=TRUE)[,1],
+             all_CD20 = scale(log_pct_til_all_CD20, center=TRUE, scale=TRUE)[,1],
+             stroma_CD20 = scale(log_pct_til_stroma_CD20, center=TRUE, scale=TRUE)[,1],
+             tumour_CD20 = scale(log_pct_til_tumour_CD20, center=TRUE, scale=TRUE)[,1],
+             all_CD163 = scale(log_pct_til_all_CD163, center=TRUE, scale=TRUE)[,1],
+             stroma_CD163 = scale(log_pct_til_stroma_CD163, center=TRUE, scale=TRUE)[,1],
+             tumour_CD163 = scale(log_pct_til_tumour_CD163, center=TRUE, scale=TRUE)[,1],
+             all_FOXP3 = scale(log_pct_til_all_FOXP3, center=TRUE, scale=TRUE)[,1],
+             stroma_FOXP3 = scale(log_pct_til_stroma_FOXP3, center=TRUE, scale=TRUE)[,1],
+             tumour_FOXP3 = scale(log_pct_til_tumour_FOXP3, center=TRUE, scale=TRUE)[,1]) |>
+    ungroup() |>
+    select(.imp:cores_FOXP3, study:tumour_FOXP3)
+  
+  df <- bind_rows(df, imp.long)
+  
+}
+
+df <- df |> 
+  select(.imp, .id, study, bcac_id, threshold, enter, fu_15, br_15, age1, age2, grade:her2,
+         chemo, all_CD8:tumour_FOXP3 )
+sites <- tibble()
+
+for (cutoff in t_values) {
+  for (iteration in 0:10) {
+  events <- df |>
+    filter(.imp==iteration, threshold==cutoff) |>  
+    group_by(study, er) |> summarise(events=sum(br_15, na.rm=TRUE))
+
+  er0_gp <- as.vector(events |> filter(er==0, events<10) |> select(1))$study
+  er1_gp <- as.vector(events |> filter(er==1, events<10) |> select(1))$study
+  diam6 <- c('ABC', 'MBC', 'MMH', 'NEA', 'OFB', 'ORI', 'RBC', 'SEA', 'SBC', 'SKK', 'SZB' )
+  diam1 <- c('EPI', 'SGB','BGS', 'CPS', 'EST', 'PSH', 'GES', 'MAR', 'PBC', 'PLC', 'UNC')
+  df2 <- df |> filter(.imp==iteration, threshold==cutoff) |>
+    select(.imp, threshold, study, bcac_id, er) |>
+    mutate(site0 = case_when(study %in% er0_gp & study %in% diam6 ~ "DIA6",
+                                        study %in% er0_gp & study %in% diam1 ~ "DIA1",
+                                        TRUE ~ study),
+           site1 = case_when(study %in% er1_gp & study %in% diam6 ~ "DIA6",
+                                        study %in% er1_gp & study %in% diam1 ~ "DIA1",
+                                        TRUE ~ study),
+           site = ifelse(er==0, site0, site1)) |> 
+    select(.imp, threshold, bcac_id, site)
+  sites <- sites |> bind_rows(df2)
+  rm(df2)
+  }
+}
+
+imp.long <- df |> left_join(sites) |> select(.imp, .id, threshold, study, site, everything())
+
+write_csv(imp.long, "./Outputs/imputed_data.csv")
+rm(df, mv, sites, events )
+
+```
+
+## Multi-variable Cox regression analyses  ----
+
+After imputation the single marker and multi-marker analyses are run with partial and full adjustment for other prognostic variables.
+
+```{r cox_mv}
+# Read in imputed data and reshape 
+imp.long <- read_csv("./Outputs/imputed_data.csv")
+
+df <- imp.long |> filter(.imp!=0) |>
+  pivot_longer(all_CD8:tumour_FOXP3, names_to='tiic', values_to='score') |>
+  # Nest the data by imputation, area thrshold, ER status and TIIC marker
+  group_by(.imp, threshold, er, tiic) |> nest()
+
+# Partially adjusted single marker models (10*6*2*12=1440 models)
+results_i <- df |> 
+  mutate(model = map(data, ~coxph(Surv(enter, fu_15, br_15) ~ site + age1 + age2 + score, data=.x))) |>
+  mutate(tidy.model = map(model, broom::tidy),
+         number = map_dbl(model, ~(.x$n)),
+         events = map_dbl(model, ~(.x$nevent))) |>
+  ungroup() |>
+  select(.imp, threshold, er, tiic, number, events, tidy.model) |>
+  unnest(cols=c(tidy.model)) |>
+  filter(term == "score") |>
+  mutate(analysis = "Multiple imputation",
+         variable="Single marker",
+         adjust="Partial")
+
+# Run fully adjusted model
+# Unnest data and re-nest without imputation (memory management for fully adjusted model)
+df <- imp.long |> filter(.imp!=0) |>
+  pivot_longer(all_CD8:tumour_FOXP3, names_to='tiic', values_to='score') |>
+  # Nest the data by imputation, area thrshold, ER status and TIIC marker
+  group_by(threshold, er, tiic) |> nest()
+
+# Use loop to loop through each imputation
+for (iteration in 1:10) {
+  full <- df |>
+    mutate(model = map(data, ~coxph(Surv(enter, fu_15, br_15) ~ site + age1 + age2 +
+                                      size + nodes + grade + tt(grade) + score,
+                                    tt = function(x, t, ...) { x * log(t)}, data=filter(.x, .imp==iteration)))) |>
+    mutate(tidy.model = map(model, broom::tidy),
+           number = map_dbl(model, ~(.x$n)),
+           events = map_dbl(model, ~(.x$nevent))) |>
+    ungroup() |>
+    select(threshold, er, tiic, number, events, tidy.model) |>
+    unnest(cols=c(tidy.model)) |>
+    filter(term == "score") |>
+    mutate(.imp=iteration,
+           analysis = "Multiple imputation",
+           variable="Single marker",
+           adjust="Full") #|>
+    results_i <- bind_rows(results_i, full)
+    rm(full)
+    print(iteration)
+}
+
+results_i <- results_i |>
+  mutate(marker= case_when(str_detect(tiic, "CD8") ~ "CD8",
+                    str_detect(tiic, "CD20") ~ "CD20",
+                    str_detect(tiic, "CD163") ~ "CD163",
+                    str_detect(tiic, "FOXP3") ~ "FOXP3"),
+         compartment = case_when(str_detect(tiic, "all") ~ "all",
+                        str_detect(tiic, "stroma") ~ "stroma",
+                        str_detect(tiic, "tumour") ~ "tumour")) |>
+  select(-tiic, -term)
+
+# Run multi-marker models
+df <- imp.long |> filter(.imp!=0) |>
+  pivot_longer(all_CD8:tumour_FOXP3, names_to = c("compartment", ".value"), names_sep="_" ) |> 
+  # Nest data
+  group_by(.imp, threshold, er, compartment) |> nest()
+
+multi.partial <- df |> 
+  mutate(model = map(data, ~coxph(Surv(enter, fu_15, br_15) ~ site + age1 + age2 + 
+                                     CD8 + CD20 + CD163 + FOXP3, 
+                                   data=.x))) |>
+  mutate(tidy.model = map(model, broom::tidy),
+         number = map_dbl(model, ~(.x$n)),
+         events = map_dbl(model, ~(.x$nevent))) |>
+  ungroup() |>  
+  select(.imp, threshold, er, compartment, number, events, tidy.model) |>
+  unnest(cols=c(tidy.model)) |> 
+  filter(term %in% c("CD8", "CD20", "CD163", "FOXP3")) |>
+  mutate(analysis = "Multiple imputation",
+         variable="Multi-marker",
+         adjust="Partial") |>
+  rename(marker=term)
+
+results_i <- bind_rows(results_i, multi.partial)
+rm(multi.partial)
+
+df <- imp.long |> filter(.imp!=0) |>
+  pivot_longer(all_CD8:tumour_FOXP3, names_to = c("compartment", ".value"), names_sep="_" ) |> 
+  # Nest data
+  group_by(threshold, er, compartment) |> nest()
+
+for (iteration in 1:10) {
+  multi.full <- df |> 
+    mutate(model = map(data, ~coxph(Surv(enter, fu_15, br_15) ~ site + age1 + age2 + 
+                                      size + nodes + grade + tt(grade) + CD8 + CD20 + CD163 + FOXP3, 
+                                    tt = function(x, t, ...) { x * log(t)}, data=filter(.x, .imp==iteration)))) |>
+    mutate(tidy.model = map(model, broom::tidy),
+           number = map_dbl(model, ~(.x$n)),
+           events = map_dbl(model, ~(.x$nevent))) |>
+    ungroup() |>
+    select(threshold, er, compartment, number, events, tidy.model) |>
+    unnest(cols=c(tidy.model)) |>
+    filter(term %in% c("CD8", "CD20", "CD163", "FOXP3")) |>
+    mutate(.imp=iteration, 
+           analysis = "Multiple imputation",
+           variable="Multi-marker",
+           adjust="Full") |>
+    rename(marker=term)
+
+  results_i <- bind_rows(results_i, multi.full)
+  rm(multi.full)
+  print(iteration)
+}
+
+rm(df)
+
+```
+
+## Combine the results across analysis of each imputed dataset 
+
+Results from analysis of 10 imputed data sets for each exclusion threshold are combined using Rubin's rules and then output saved.
+
+```{r rubin}
+est_mean <- results_i |>
+  group_by(variable, er, marker, compartment, threshold, adjust) |>
+  summarise(est_mean=mean(estimate))
+
+results  <-  results_i |>
+  left_join(est_mean) |>
+  mutate(diff = estimate - est_mean,
+         variance=std.error^2) |>
+  group_by(analysis, variable, er, marker, compartment, threshold, adjust) |>
+  rename(area = threshold) |>
+  summarise(estimate=mean(estimate),
+            var_w=mean(variance),
+            var_b = mean(diff^2)/9,
+            number = round(mean(number)),
+            events=round(mean(events))) |>
+  mutate(score = "Std",
+         std.error = (var_w + var_b + var_b/10)^.5,
+         statistic = estimate/std.error,
+         p.value = 2*pnorm(abs(statistic), lower.tail=F),
+         signif = p.value<0.05,
+         hr = exp(estimate),
+         lcl = exp(estimate - qnorm(0.975)*std.error),
+         ucl = exp(estimate + qnorm(0.975)*std.error),
+         subtype = ifelse(er==0, "ER negative", "ER positive")) |>
+  select(-var_w, -var_b, -statistic) |>
+  arrange(er, marker, compartment, desc(variable), desc(adjust)) |> ungroup()
+
+results <- results |> bind_rows(uni_marker) |>
+  select(variable, analysis, area, subtype, marker, compartment, adjust, score, estimate, std.error:ucl, number, events) |> arrange(desc(variable), analysis, area, subtype, marker, compartment, adjust)
+
+rm(est_mean, results_i, uni_marker)
+
+write_csv(results, "./Outputs/table_s5.csv")
+
+```
+
+## Fraction model variance explained by TIIC scores
+
+The relative variation [21] accounted for by TIIC scores as 
+1 – adequacy index = 1 – LRstandard/LRstandard+B
+where LR is the likelihood ratio chi-squared statistic, the standard model includes age at diagnosis, ER status, grade, tumor size, number of positive nodes and B denotes the inclusion of TIIC scores as predictors.
+
+Mean value across 10 data sets imputed with the tissue adequacy threshold set at .05mm2. 
+
+```{r variance, echo=FALSE}
+#imp.long <- read_csv("./Outputs/imputed_data.csv") |> filter(threshold==0.05)
+
+adequacy <- tibble(imputation= numeric(),
+                   er = numeric(),
+                   tils= numeric(),
+                   site= numeric(),
+                   age = numeric(),
+                   size = numeric(),
+                   nodes = numeric(),
+                   grade = numeric(),
+                   all = numeric())
+
+ll_fun <- function(x, y) {
+  df <- filter(imp.long, er==x, .imp==y) 
+  ll <- c(0, 0, 0, 0, 0, 0 ,0)
+  i <- 0
+  for (variables in c("site + age1 + age2 + size + nodes + grade + tt(grade)",
+                      "age1 + age2 + size + nodes + grade + tt(grade) + all_CD163 + all_CD20 + 
+                       all_CD8 + all_FOXP3",
+                       "site + size + nodes + grade + tt(grade) + all_CD163 + all_CD20 + 
+                       all_CD8 + all_FOXP3",
+                      "site + age1 + age2 + nodes + grade + tt(grade) + all_CD163 + all_CD20 + 
+                       all_CD8 + all_FOXP3",
+                       "site + age1 + age2 + size + grade + tt(grade) + all_CD163 + all_CD20 + 
+                       all_CD8 + all_FOXP3",
+                      "site + age1 + age2 + size + nodes + all_CD163 + all_CD20 + 
+                       all_CD8 + all_FOXP3",
+                      "site + age1 + age2 + size + nodes + grade + tt(grade) + all_CD163 + all_CD20 + 
+                       all_CD8 + all_FOXP3")) {
+    formula <- paste0("Surv(enter, fu_15, br_15) ~ ", variables) 
+    fit <- coxph(as.formula(formula),
+                 data=df, 
+                 tt = function(x, t, ...) { x * log(t)})
+    temp <- 2*(fit$loglik[2]-fit$loglik[1])
+    i <- i + 1
+    ll[i] <- temp
+  }
+  return(ll)
+}
+
+for (imputation in 1:10) {
+  for (er in 0:1) {
+    ll = ll_fun(x=er, y=imputation)
+    row <- tibble(imputation= imputation, 
+                  er = er, 
+                  tils= ll[1],
+                  site = ll[2],
+                  age = ll[3],
+                  size = ll[4],
+                  nodes = ll[5],
+                  grade = ll[6],
+                  all = ll[7]
+                  )
+    adequacy <- bind_rows(adequacy, row)
+  }
+}
+
+adequacy_summary <- adequacy |> filter(!is.na(site)) |>
+  mutate(rsq_tils = 1 - tils/all,
+         rsq_site = 1 - site/all,
+         rsq_age = 1 - age/all,
+         rsq_size = 1 - size/all,
+         rsq_nodes = 1 - nodes/all,
+         rsq_grade = 1 - grade/all) |>
+  group_by(er) |>
+  summarise(rsq_tils = mean(rsq_tils),
+            rsq_site = mean(rsq_site),
+            rsq_age = mean(rsq_age),
+            rsq_size = mean(rsq_size),
+            rsq_nodes = mean(rsq_nodes),
+            rsq_grade = mean(rsq_grade))
+
+write_csv(adequacy_summary, "./Outputs/adequacy_results.csv")
+#rm(adequacy, adequacy_summary)
+```
+
+## Evaluating heterogeneity between studies
+
+Based on the imputed data when using the 0.05 mm2 threshold
+
+```{r}
+# Generate empty object to store results
+study_results_i <- tibble(study= character(),
+                     imputation = numeric(),
+                     er = numeric(),
+                     term = character(),
+                     estimate = numeric(),
+                     std.error = numeric())
+
+for (imputation in 1:10) {
+  for (er_status in 0:1) {
+    sites <- imp.long |> filter(er==er_status, threshold==0.05) |> select(site)
+    studies <- unique(sites$site)
+        for (set in studies) {
+            df <- imp.long |> filter(er==er_status, .imp==imputation, threshold==0.05, site==set)
+            
+            fit <- coxph(Surv(enter, fu_15, br_15) ~ all_CD163 + all_CD20 + 
+                       all_CD8 + all_FOXP3 + 
+                           age1 + age2 + size + nodes + grade + tt(grade),
+                         tt = function(x, t, ...) { x * log(t)},
+                         data=df)
+            
+            het <- tidy(fit)[1:4, c(1:3,5)] |>
+              mutate(study = set,
+                     imputation = imputation,
+                     er = er_status)
+            study_results_i <- bind_rows(study_results_i, het)
+    }
+  }
+}
+
+est_mean <- study_results_i |>
+  mutate(marker= case_when(str_detect(term, "CD8") ~ "CD8",
+                           str_detect(term, "CD20") ~ "CD20",
+                           str_detect(term, "CD163") ~ "CD163",
+                           str_detect(term, "FOXP3") ~ "FOXP3"),
+         compartment = "All") |>
+  group_by(study, er, marker) |>
+  summarise(est_mean=mean(estimate))
+
+study_results  <-  study_results_i |>
+  mutate(marker= case_when(str_detect(term, "CD8") ~ "CD8",
+                           str_detect(term, "CD20") ~ "CD20",
+                           str_detect(term, "CD163") ~ "CD163",
+                           str_detect(term, "FOXP3") ~ "FOXP3"),
+         compartment = case_when(str_detect(term, "all") ~ "All",
+                                 str_detect(term, "stroma") ~ "Stroma",
+                                 str_detect(term, "tumour") ~ "Tumour")) |>
+  left_join(est_mean) |>
+  mutate(diff = estimate - est_mean,
+         variance=std.error^2) |>
+  group_by(study, er, marker, compartment) |>
+  summarise(estimate=mean(estimate),
+            var_w=mean(variance),
+            var_b = mean(diff^2)/9) |>
+  mutate(std.error = (var_w + var_b + var_b/10)^.5,
+         statistic = estimate/std.error,
+         p.value = 2*pnorm(abs(statistic), lower.tail=F),
+         analysis = "Multiple imputation",
+         threshold = 0.05,
+         adjust = "Full",
+         variable = "Multi-marker") |>
+  select(analysis, adjust, variable, threshold, marker, compartment, er, study, estimate, std.error, p.value, -var_w, -var_b) 
+rm(study_results_i)
+
+# Meta-analysis of the study specific results
+meta_fun <- function(x, y) { 
+  df <- study_results |> filter(er==x, marker==y)
+  m <- metagen(data=df,
+          studlab=study, 
+          TE=estimate, seTE=std.error,
+          backtransf=TRUE, sm="HR",
+          comb.random=FALSE)
+  return(c(m$I2, m$pval.Q))
+}
+
+het_results <- tibble(marker=character(),
+                      er=numeric(),
+                      p.het = numeric(),
+                      i2 = numeric())
+
+for (marker in c("CD8", "CD20", "CD163", "FOXP3")) {
+  for (er in 0:1) {
+    test <- meta_fun(x=er, y=marker)
+    out <- tibble(marker=marker,
+                  er=er,
+                  p.het = test[2],
+                  i2 = test[1])
+    het_results <- bind_rows(het_results, out)
+    rm(test, out)
+  }
+}
+  
+write_csv(het_results, "./Outputs/table_s6.csv")
+rm(study_results_i, study_results, het_results)
+```
+
+## Comparing effect estimates in HER2+ v HER2 - and chemo + and chemo -
+
+```{r subgroups, include=FALSE}
+iterations <- 10
+cutoff <- 0.05
+#imp.long <- read_csv("./Outputs/imputed_data.csv") 
+
+df <- imp.long |>
+  filter(threshold==cutoff, .imp!=0) |>
+  mutate(outcome=br_15)
+  
+subgroup.results <- tibble()
+for (subgroup in c("her2", "chemo")) {
+  df <- imp.long |>
+  filter(threshold==cutoff) |>
+  mutate(outcome=br_15,
+         temp = subgroup,
+         subset=ifelse(temp=="her2", her2, chemo))
+  
+  for (group in 0:1) {
+    for (er_status in 0:1) {
+      for (iteration in 1:iterations) {
+        
+        imp.subset <- df |> filter(er==er_status, .imp==iteration, subset==group) 
+
+        models <- lapply(imp.subset[19:30],
+                         function(x) coxph(Surv(enter, fu_15, outcome) ~
+                                             x + age1 + age2 + nodes + size + grade + tt(grade) + site,
+                                           tt = function(x, t, ...) { x * log(t)},
+                                           data=imp.subset))
+        summaries <- lapply(models, summary)
+        term <- names(imp.subset[,19:30])
+        estimate <- as.numeric(unlist(lapply(summaries, function(x) x$coefficients[1,1])))
+        std.error <- as.numeric(unlist(lapply(summaries, function(x) x$coefficients[1,3])))
+        p.value <- as.numeric(unlist(lapply(summaries, function(x) x$coefficients[1,5])))
+        n <- as.numeric(unlist(lapply(summaries, function(x) x$n)))
+        nevents <- as.numeric(unlist(lapply(summaries, function(x) x$nevent)))
+        uv <- tibble(term, estimate, std.error, p.value, n, nevents) |>
+          mutate(subset = subgroup,
+                 stratum = ifelse(group==0, "G0", "G1"),
+                 n = n,
+                 nevents = nevents,
+                 iteration=iteration,
+                 variable = "Single marker",
+                 threshold = cutoff,
+                 subtype = ifelse(er_status==1, "ER positive", "ER negative"),
+                 adjust = "Full")
+        
+        subgroup.results <- bind_rows(subgroup.results, uv)
+        
+        for (compartment in c("all", "stroma", "tumour")) { 
+          
+          v1 <- paste0(compartment, "_CD8 + ")
+          v2 <- paste0(compartment, "_FOXP3 + ")
+          v3 <- paste0(compartment, "_CD20 + ")
+          v4 <- paste0(compartment, "_CD163 + ")
+          
+          formula <- paste0("Surv(enter, fu_15, outcome) ~ ", v1, v2, v3, v4, 
+                            " + age1 + age2 + grade + size + nodes + tt(grade) +", 
+                            " site")
+          mi <- coxph(as.formula(formula), 
+                      tt = function(x, t, ...) { x * log(t)},
+                      data=imp.subset)
+          mv <- tidy(mi)[1:4, c(1:3,5)] |>
+            mutate(subset = subgroup,
+                   stratum = ifelse(group==0, "G0", "G1"),
+                   iteration = iteration,
+                   variable = "Multi-marker",
+                   threshold = cutoff,
+                   subtype = ifelse(er_status==1, "ER positive", "ER negative"),
+                   adjust = "Full")
+          mv$n <- mi$n
+          mv$nevents <- mi$nevent
+          subgroup.results <- bind_rows(subgroup.results, mv)
+        }
+      }
+    }
+  }
+} 
+
+subgroup.results <- subgroup.results |> 
+  mutate(marker= case_when(str_detect(term, "CD8") ~ "CD8",
+                           str_detect(term, "CD20") ~ "CD20",
+                           str_detect(term, "CD163") ~ "CD163",
+                           str_detect(term, "FOXP3") ~ "FOXP3"),
+         compartment = case_when(str_detect(term, "all") ~ "All",
+                                 str_detect(term, "stroma") ~ "Stroma",
+                                 str_detect(term, "tumour") ~ "Tumour"))
+est.mean <- subgroup.results |>
+  group_by(subset, stratum, variable, subtype, marker, compartment) |>
+  summarise(number=n(), mean.est=mean(estimate)) |> ungroup()
+
+subgroup.results  <-  subgroup.results |>
+  left_join(est.mean) |>
+  mutate(diff = estimate - mean.est,
+         variance=std.error^2) |>
+  group_by(subset, stratum, variable, subtype, marker, compartment) |>
+  summarise(estimate=mean(estimate),
+            var_w=mean(variance),
+            var_b = mean(diff^2)/9,
+            n = round(mean(n)),
+            nevents=round(mean(nevents))) |>
+  mutate(std.error = (var_w + var_b + var_b/10)^.5,
+         statistic = estimate/std.error,
+         p.value = 2*pnorm(abs(statistic), lower.tail=F),
+         hr = exp(estimate),
+         lcl = exp(estimate - qnorm(0.975)*std.error),
+         ucl = exp(estimate + qnorm(0.975)*std.error)) |>
+  select(-var_w, -var_b, -statistic) |> ungroup()
+
+subs <- subgroup.results |> select(1:7, 10, 11) |>
+  pivot_wider(names_from="stratum", values_from=7:9) |>
+  mutate(subset = factor(subset, labels=c("Chemo v no chemo", "HER2 pos v HER2 neg")),
+         diff = abs(estimate_G0-estimate_G1),
+         se.diff = sqrt(std.error_G0^2 + std.error_G1^2),
+         z = diff/se.diff,
+         p.value.diff = 2*pnorm(z, lower.tail=FALSE)) |> arrange(p.value.diff) |>
+  #filter(as.integer(subset)<3) |>
+  mutate(rank = rank(p.value.diff),
+         p.exp = (rank - 0.5)/96,
+         significant = p.value.diff<0.05,
+         hr_g1 = exp(estimate_G1),
+         lcl_g1 = exp(estimate_G1 - qnorm(.975)*std.error_G1),
+         ucl_g1 = exp(estimate_G1 + qnorm(.975)*std.error_G1),
+         hr_g0 = exp(estimate_G0),
+         lcl_g0 = exp(estimate_G0 - qnorm(.975)*std.error_G0),
+         ucl_g0 = exp(estimate_G0 + qnorm(.975)*std.error_G0)) |>
+  select(1:5, 19:24, 15, everything()) |>
+  arrange(subset, variable, subtype, marker, compartment)
+
+write_csv(select(subs, 1:12), "./Outputs/table_s7.csv")
+rm(df, est_mean, fit, imp, imp.long, imp.subset, subgroup.results, study_results, row, sites, models, mi, mv, summaries, uv )
+```
+
+## Tables
+
+```{r tables, include=FALSE}
+data <- pheno |> 
+  mutate(er = ifelse(is.na(er), 9, er),
+         age_gp = cut(age_diag, breaks=c(0, 40, 60, 80, Inf), right=FALSE),
+         size_gp = cut(size, breaks=c(0, 20, 50, Inf), right=FALSE),
+         node_gp = cut(nodes, breaks=c(0, 1, 4, 10, Inf), right=FALSE))
+tab1 <- data |> group_by(study) |>
+  summarise( cases = n(), age_mean=mean(age_diag), age_min=min(age_diag), age_max=max(age_diag))
+write_csv(tab1, "./Outputs/table_1.csv")
+
+myVars <- c("age_gp", "grade", "size_gp", "node_gp", "br_15", "bcss_15", "fu_15")
+
+## Vector of categorical variables that need transformation
+catVars <- c("age_gp", "grade", "size_gp", "node_gp", "br_15", "bcss_15")
+
+## Create a TableOne object
+tab2 <- CreateTableOne(vars = myVars, data = data, factorVars = catVars, 
+                       strata = "er",
+                       includeNA = TRUE)
+
+print(tab2, showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+rm(tab1, tab2)
+
+```
+
+## Figures
+
+## Figure 1
+
+```{r fig1, echo=FALSE}
+#results <- read_csv("./Outputs/results.csv")
+
+limits <- c(0.7, 1.4)
+breaks <- c(0.7, 0.8, 0.9, 1, 1.1, 1.2)
+
+plot_fun <- function(var, anal, til, thresh) {
+  ggforestplot::forestplot(
+    df = filter(results, analysis==anal, variable==var, marker==til, area==thresh),
+    name=compartment, 
+    estimate = estimate,
+    se = std.error,
+    colour = adjust,
+    logodds= TRUE,
+    title = til,
+    xlab = "Hazard ratio per standard deviation") +
+    scale_color_manual(values=c('cadetblue4','goldenrod4')) +
+    scale_x_log10(limits=limits, breaks=breaks) +
+    ggforce::facet_col(
+      facets = ~subtype,
+      scales = "free_y",
+      space = "free") +
+   theme(legend.position="none")
+}
+
+cd8_log_pct <- plot_fun(var="Single marker", anal="Multiple imputation", til="CD8", thresh=0.05) +
+  theme(title = element_text(size=10))
+cd20_log_pct <- plot_fun(var="Single marker", anal="Multiple imputation", til="CD20", thresh=0.05) +
+  theme(title = element_text(size=10))
+foxp3_log_pct <- plot_fun(var="Single marker", anal="Multiple imputation", til="FOXP3", thresh=0.05) +
+  theme(title = element_text(size=10))
+cd163_log_pct <- plot_fun(var="Single marker", anal="Multiple imputation", til="CD163", thresh=0.05) +
+  theme(title = element_text(size=10))
+
+fig_1 <- (cd8_log_pct + foxp3_log_pct) / (cd20_log_pct + cd163_log_pct)
+ggsave("./Figures/fig_1.jpg", units="cm", height=20, width=17)
+rm(cd8_log_pct, cd20_log_pct, cd163_log_pct, foxp3_log_pct)
+```
+
+## Figure 2
+```{r fig2, echo=FALSE}
+limits <- c(0.7, 1.4)
+breaks <- c(0.7, 0.8, 0.9, 1, 1.1, 1.2)
+
+mv_plot_function <- function(anal, sub, adj, thresh) {
+  ggforestplot::forestplot(
+    df = filter(results, variable=="Multi-marker", analysis==anal, 
+                subtype==sub, adjust==adj, area==thresh) ,
+    name=compartment, 
+    colour=marker,
+    estimate = estimate,
+    se = std.error,
+    logodds= TRUE,
+    title = paste0(sub, ": ", adj),
+    xlab = "Hazard ratio per standard deviation") +
+    scale_color_manual(values=c('cadetblue4','goldenrod4', "firebrick4", "darkolivegreen")) +
+    scale_x_log10(limits=limits, breaks=breaks) +
+    ggforce::facet_col(
+      facets = ~marker,
+      scales = "free_y",
+      space = "free") +
+    theme(legend.position="none")
+}
+
+mv_mi_par_er0 <- mv_plot_function(anal="Multiple imputation", sub="ER negative", adj="Partial", thresh=0.05) +
+  theme(title = element_text(size=10))
+mv_mi_par_er1 <- mv_plot_function(anal="Multiple imputation", sub="ER positive", adj="Partial", thresh=0.05) +
+  theme(title = element_text(size=10))
+mv_mi_full_er0 <- mv_plot_function(anal="Multiple imputation", sub="ER negative", adj="Full", thresh=0.05) +
+  theme(title = element_text(size=10))
+mv_mi_full_er1 <- mv_plot_function(anal="Multiple imputation", sub="ER positive", adj="Full", thresh=0.05) +
+  theme(title = element_text(size=10))
+
+fig_2 <- (mv_mi_par_er0 + mv_mi_full_er0) /  (mv_mi_par_er1 + mv_mi_full_er1)
+ggsave("./Figures/fig_2.jpg", units="cm", height=20, width=17)
+rm(mv_mi_par_er0, mv_mi_par_er1, mv_mi_full_er0, mv_mi_full_er1)
+```
+
+## Figure 3
+
+```{r fig3, include=FALSE}
+fig_3 <- ggplot(filter(subs, compartment=="All"), 
+                aes(x=hr_g0, y=hr_g1, color=marker, shape=subtype)) +
+  geom_point() +
+  geom_abline(linetype="dashed") +
+  geom_vline(xintercept=1, color='gray80') +
+  geom_hline(yintercept=1, color='gray80') +
+  scale_x_log10() +
+  scale_y_log10() +
+  facet_grid(subset~variable) +
+  theme_bw() +
+  labs(shape="ER status",
+       size="P diff < 0.05",
+       color="Marker",
+       y = "Hazard ratio in first group",
+       x = "Hazard ratio in  second group")
+fig_3
+ggsave("./Figures/fig_3.jpg", units="cm", height=12, width=17)
+```
+
+## Supp Figure 1
+
+Boxplot and jitter plot of core tissue area (tumor plus stroma) by study and tumor core diameter
+
+```{r suppfig1, echo=FALSE}
+levels <- c('ABC', 'MBC', 'MMH', 'NEA', 'ORI', 'RBC', 'SEA', 'SBC', 'SKK', 'SZB',
+            'EPI', 'SGB','BGS', 'CPS', 'EST', 'PSH', 'MAR', 'PBC', 'PLC', 'UNC')
+plot_data <- halo |>
+  mutate(study = factor(study, levels=levels),
+         pct_til_all = area_all_til_halo/(10^4*area_all_mn),
+         pct_til_stroma = ifelse(area_stroma_mn==0, NA, area_stroma_til_halo/(area_stroma_mn*10^4)),
+         pct_til_tumour = ifelse(area_tumour_mn==0, NA, area_tumour_til_halo/(area_tumour_mn*10^4)),
+         pct_artefact = area_artefact_mn/(area_all_mn + area_artefact_mn),
+         log_pct_til_all = log(pct_til_all + 0.1),
+         log_pct_til_stroma = log(pct_til_stroma + 0.1),
+         log_pct_til_tumour = log(pct_til_tumour + 0.1))
+fig_s01 <- ggplot(plot_data, aes(x=study, y=area_all_mn, color=as.factor(core_size))) +
+  geom_jitter(alpha=0.01) +
+  geom_hline(yintercept = c(pi*0.3^2, pi*0.5^2), linetype='dashed') +
+  scale_color_manual(values= c('cadetblue3','goldenrod3', "firebrick4")) +
+  coord_capped_cart(left="both") +
+  geom_boxplot(outliers=FALSE, fill=NA, color='darkblue') + 
+  annotate("text", label="0.6 mm cores", x=5, y=1.3) +
+  annotate("text", label="1 mm cores", x=15, y=2.1) +
+  annotate("text", label="2 mm cores", x=19, y=6.1) +
+  theme_classic() +
+  theme(legend.position="none",
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(x= "Study", y="Core tissue area (sq mm)")
+fig_s01
+ggsave('./Figures/fig_s01.png', , units="cm", height=10, width=17)
+rm(fig_s01)
+```
+
+## Sup Figure 2
+
+Boxplot of distribution of TIIC scores (percentage of the tissue area occupied by TIICs) by marker and tumor core size.  Y-axis is log scale.
+
+```{r suppfig2, echo=FALSE}
+fig_s02 <- ggplot(plot_data, aes(x=core_size, y=(pct_til_all + 0.1), color=marker)) +
+  geom_jitter(alpha=0.05) +
+  scale_color_manual(values= c('cadetblue3','goldenrod3', "darkolivegreen", "firebrick4")) +
+  scale_y_log10(limits=c(0.1, 100), breaks=c(0.1, 1, 10, 100)) +
+  coord_capped_cart(left="both") +
+  geom_boxplot(outliers=FALSE, fill=NA, color='darkblue') + 
+  facet_wrap(~marker) +
+  theme_classic() +
+  theme(legend.position="none",
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_blank()) +
+  labs(x= "Core size", y="Percent TIL/TAM area")
+fig_s02
+ggsave("./Figures/fig_s02.png", units="cm", height=10, width=17)
+rm(fig_s02)
+```
+## Sup Figure 3
+
+Scatterplots of pathologist CD8+ TIL scores v automated CD8+ TIL scores (percent tissue area) by tissue compartment
+
+```{r suppfig3, echo=FALSE}
+
+cd8 <- read_csv("./Data/cd8_hra_halo.csv") 
+ano <- tibble(compartment=c("All", "Stroma", "Tumour"),
+              xtext = c(5, 5, 5),
+              ytext = c(1000, 1000, 1000),
+              lab = c("Rho=0.76", "Rho=0.62", "Rho=0.71"))
+fig_s03 <- ggplot(cd8, aes(x=hra, y=halo)) +
+  geom_point(alpha=0.2, color='blue', size=0.5) +
+  #geom_smooth( method='lm', se=FALSE, color='grey50', linewidth=0.5) +
+  geom_text(data=ano, aes(x=xtext, y=ytext, label=lab), size=3) +
+  lemon::coord_capped_cart(left='both', bottom='both') +
+  scale_y_log10(breaks=c(0.1, 1, 10, 100, 1000), labels = label_comma(accuracy=1)) +
+  scale_x_log10(breaks=c(0.1, 1, 10, 100, 1000), labels = label_comma(accuracy=1)) + 
+  facet_wrap(~compartment) + 
+  theme_classic() +
+  theme(strip.background = element_blank()) +
+  labs(x= "Pathologist CD8 cell count per HPF", y = "Automated CD8 cell count")
+fig_s03
+ggsave("./Figures/fig_s03.png", units="cm", height=10, width=17)
+rm(fig_s03, cd8, ano)
+```
+## Sup Figure 4
+
+Hazard ratio for association between TIIC score and breast cancer specific survival by marker, ER status, tissue compartment and core exclusion threshold. Fully-adjusted single marker models with imputed data.
+
+```{r suppfig4, echo=FALSE}
+limits <- c(0.7, 1.4)
+breaks <- c(0.7, 0.8, 0.9, 1, 1.1, 1.2)
+
+sens_fun_uv <- function(var, adj, til, anal) {
+  ggforestplot::forestplot(
+    df = filter(results, variable==var, marker==til, adjust==adj, analysis==anal) ,
+    name=compartment, 
+    estimate = estimate,
+    se = std.error,
+    colour = as.factor(area),
+    logodds= TRUE,
+    title = til,
+    xlab = "Hazard ratio per standard deviation") +
+    scale_x_log10(limits=limits, breaks=breaks) +
+    ggforce::facet_col(
+      facets = ~subtype,
+      scales = "free_y",
+      space = "free") +
+    labs(colour = "Tissue area exclusion")
+} 
+
+cd8_sens <- sens_fun_uv(var="Single marker", adj="Full", til="CD8", anal="Multiple imputation") +
+  theme(title = element_text(size=10))
+cd20_sens <- sens_fun_uv(var="Single marker", adj="Full", til="CD20", anal="Multiple imputation")  +
+  theme(title = element_text(size=10))
+foxp3_sens <- sens_fun_uv(var="Single marker", adj="Full", til="FOXP3", anal="Multiple imputation")  +
+  theme(title = element_text(size=10))
+cd163_sens <- sens_fun_uv(var="Single marker", adj="Full", til="CD163", anal="Multiple imputation")  +
+  theme(title = element_text(size=10))
+
+fig_s04 <- (cd8_sens + foxp3_sens) / (cd20_sens + cd163_sens) +  
+  plot_layout(guides = 'collect') 
+fig_s04
+ggsave("./Figures/fig_s04.png", units="cm", height=20, width=17)
+rm(cd8_sens, foxp3_sens, cd20_sens, cd163_sens, fig_s04)
+```
+## Sup Figure 7
+
+Jitter plot with superimposed boxplot of log(percent artefact+0.1) for each core by marker
+
+```{r suppfig7, echo=FALSE}
+
+fig_s07 <- ggplot(plot_data, aes(x=marker, y=log(pct_artefact*100+0.1))) +
+  geom_jitter(alpha=0.02, color='cadetblue4') +
+  geom_boxplot(outliers=FALSE, fill=NA, color='darkblue') + 
+  coord_capped_cart(left="both") +
+  theme_classic() +
+  theme(axis.line.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(x= "Marker", y = "Log(percent artefact)")
+fig_s07
+ggsave("./Figures/fig_s07.png", plot=fig_s07, units="cm", height=10, width=17)
+rm(fig_s07)
+
+```
+## Sup Figure 8
+
+Scatterplot of percent tissue artefact against percent TIIC by marker
+
+```{r suppfig8, echo=FALSE}
+fig_s08 <- ggplot(plot_data, aes(x=log(pct_til_all+0.1), y=log(100*pct_artefact+0.1))) +
+  geom_point(alpha=0.02, color='cadetblue4') +
+  #geom_smooth(method='lm', se=FALSE) +
+  lemon::coord_capped_cart(ylim=c(-2.5, 3.0), left='both', bottom='both') +
+  facet_wrap(~marker) + theme_classic() +
+  theme(strip.background = element_blank()) +
+  labs(x= "Log percent TIL", y = "Log percent artefact")
+fig_s08
+ggsave("./Figures/fig_s08.png", units="cm", height=10, width=17)
+rm(fig_s08)
+```
+## Sup Figure 9
+
+Scatterplot of total tissue area against percent TIIC by marker and tumour core size
+
+```{r suppfig9}
+
+fig_s09 <- ggplot(plot_data, aes(x=log(pct_til_all+0.1), y=area_all_mn)) +
+  geom_point(alpha=0.02, color='cadetblue4') +
+  geom_smooth(method='lm', se=FALSE, colour='cadetblue4', linewidth=0.5) +
+  lemon::coord_capped_cart(ylim=c(-2.5, 3.0), left='both', bottom='both') +
+  facet_grid(marker ~ core_size) + theme_classic() +
+  theme(strip.background = element_blank()) +
+  labs(x= "Log percent TIL", y = "Tissue area mm^2")
+fig_s09
+ggsave("./Figures/fig_s09.png", units="cm", height=10, width=17)
+rm(fig_s09)
+```
+## supplementary Figure 10 and 11 
+
+Scatterplot of Scaled Schoenfeld residuals against time for grade, number of positive nodes and tumour size in ER-negative Cox regression model
+
+Scatterplot of Scaled Schoenfeld residuals against time for age at diagnosis, grade, number of positive nodes and tumour size in the ER-positive Cox regression model.  age1 and age2 are the transformed variables for age at diagnosis.
+
+```{r suppfig10, echo=FALSE}
+imp.long <- read_csv("./Outputs/imputed_data.csv")
+df <- imp.long |> filter(er==0, .imp==1) 
+fit <-  coxph(Surv(enter, fu_15, br_15) ~ site + age1 + size + nodes + grade,
+              data=df)
+resid_er0 <- tibble(time = cox.zph(fit)$time, age1 = cox.zph(fit)$y[,2],
+                    size = cox.zph(fit)$y[,3], nodes = cox.zph(fit)$y[,4], grade = cox.zph(fit)$y[,5]) |>
+  pivot_longer(2:5, values_to="beta", names_to="variable") |>
+  filter(beta<600, beta>-600)
+
+fig_s10 <-ggplot(resid_er0, aes(x=time, y = beta)) +
+  geom_point(color="blue", alpha=0.2) +
+  geom_smooth(method="lm", color="black", se=FALSE) +
+  coord_capped_cart(left="both", bottom="both") +
+  facet_wrap(~variable, scales="free") +
+  theme_classic() +
+  theme(strip.background=element_rect(color="white")) +
+  labs(x = "Time", y="Beta")
+ggsave("./Figures/fig_s10.png", plot=fig_s10, units="cm", height=10, width=17)
+
+df <- imp.long |> filter(er==1, .imp==1)
+fit <-  coxph(Surv(enter, fu_15, br_15) ~ site + age1 + age2 + size + nodes + grade,
+              data=df)
+resid_er1 <- tibble(time = cox.zph(fit)$time, age1 = cox.zph(fit)$y[,2], age2 = cox.zph(fit)$y[,3],
+                    size = cox.zph(fit)$y[,4], nodes = cox.zph(fit)$y[,5], grade = cox.zph(fit)$y[,6]) |>
+  pivot_longer(2:6, values_to="beta", names_to="variable") |>
+  filter(beta<600, beta>-600)
+
+fig_s11 <- ggplot(resid_er1, aes(x=time, y = beta)) +
+  geom_point(color="blue", alpha=0.2) +
+  geom_smooth(method="lm", color="black", se=FALSE) +
+  coord_capped_cart(left="both", bottom="both") +
+  facet_wrap(~variable, scales="free") +
+  theme_classic() +
+  theme(strip.background=element_rect(color="white")) +
+  labs(x = "Time", y="Beta")
+ggsave("./Figures/fig_s11.png", plot=fig_s11, units="cm", height=10, width=17)
+rm(fig_1, fig_2, fig3, fig_s10, fig_s11, imp.long, df, resid_er0, resid_er1)
+```
