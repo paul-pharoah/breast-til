@@ -5,8 +5,8 @@ There are two linked data sets
 **case_data.csv** is the clinical data set for 12,285 cases with a single row per case
 
 study -        study acromym     
-bcac_id	-		   unique identifier in BCAC database.    
 site -         variable use to adjust by study where studies with few events are pooled    
+case_id	-		   unique case identifier
 yod -          year of diagnosis.    
 morphology -   tumour morhology     
 age_diag -     age at diagnosis     
@@ -38,7 +38,7 @@ chemo -        indicator variable for adjuvant chemotherapy
 This table has a many-to-one relationship with the case data as there are multiple markers and some cases include more than 1 tumour core in TMAs
 
 study	-			            study acronym          
-bcac_id	-		            unique identifier in BCAC database          
+case_id	-		            unique identifier        
 core_id	-		            unique tissue micro-array core identifier          
 core_size	-		          TMA core size          
 marker	-		            IHC marker          
